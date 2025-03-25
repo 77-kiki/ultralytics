@@ -76,6 +76,13 @@ class Conv(nn.Module):
         Returns:
             (torch.Tensor): Output tensor.
         """
+
+        """
+        if hasattr(self,'i'):
+            if self.i == 1:
+                aaaa = 0  # [2, 32, 320, 320]        
+        """
+
         return self.act(self.bn(self.conv(x)))
 
     def forward_fuse(self, x):
