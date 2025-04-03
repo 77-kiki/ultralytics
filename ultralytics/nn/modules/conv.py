@@ -77,10 +77,10 @@ class Conv(nn.Module):
             (torch.Tensor): Output tensor.
         """
 
-        """
+        """        
         if hasattr(self,'i'):
-            if self.i == 1:
-                aaaa = 0  # [2, 32, 320, 320]        
+            if self.i == 7:
+                aaaa = 0   
         """
 
         return self.act(self.bn(self.conv(x)))

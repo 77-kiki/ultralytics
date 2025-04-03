@@ -10,6 +10,7 @@ from ultralytics.utils.torch_utils import fuse_conv_and_bn
 from .conv import Conv, DWConv, GhostConv, LightConv, RepConv, autopad
 from .transformer import TransformerBlock
 
+
 __all__ = (
     "DFL",
     "HGBlock",
@@ -50,6 +51,16 @@ __all__ = (
     "PSA",
     "SCDown",
     "TorchVision",
+    "C3k2_A",
+    "PConv",
+    "PWConv",
+    "ShuffleAttentionV1",
+    "P2CF",
+    "C2f_A",
+    "C3k_A",
+    "C3k_B",
+    "C3k2_B",
+    "ACmix",
 )
 
 
@@ -297,9 +308,12 @@ class C2f(nn.Module):
 
     def forward(self, x):
         """Forward pass through C2f layer."""
+        if hasattr(self,'i'):
+            if self.i == 13:
+                aaaa = 0     
         y = list(self.cv1(x).chunk(2, 1))
         y.extend(m(y[-1]) for m in self.m)
-        return self.cv2(torch.cat(y, 1))
+        return self.cv2(torch.cat(y, 1))   # [2, 128, 160, 160]
 
     def forward_split(self, x):
         """Forward pass using split() instead of chunk()."""
@@ -1859,3 +1873,369 @@ class A2C2f(nn.Module):
         if self.gamma is not None:
             return x + self.gamma.view(-1, len(self.gamma), 1, 1) * y
         return y
+
+
+from torch.nn import init
+from torch.nn.parameter import Parameter
+
+
+class PConv(nn.Module):
+    def __init__(self, dim, ouc, n_div=4, type_forward='split_cat'):
+        """
+        Partial Convolution
+        :param dim: Number of input channels
+        :param ouc: Output channels
+        :param n_div: Reciprocal of the partial ratio
+        :param forward: Forward type, 'slicing' or 'split_cat'
+        """
+        super(PConv, self).__init__()
+        self.type_forward = type_forward
+        self.dim_conv3 = dim // n_div
+        self.dim_untouched = dim - self.dim_conv3
+        self.partial_conv3 = nn.Conv2d(
+            self.dim_conv3, self.dim_conv3, 3, 1, 1, bias=False)
+        self.conv = nn.Conv2d(dim, ouc, kernel_size=1)
+        # self.conv = nn.Conv2d(dim, ouc, k, s, autopad(k, p, d), groups=g, dilation=d, bias=False)
+
+        if type_forward == 'slicing':
+            self.forward = self.forward_slicing
+        elif type_forward == 'split_cat':
+            self.forward = self.forward_split_cat
+        else:
+            raise NotImplementedError
+
+    def forward_slicing(self, x):
+        # only for inference
+        x = x.clone()  # !!! Keep the original input intact for the residual connection later
+        x[:, :self.dim_conv3, :, :] = self.partial_conv3(
+            x[:, :self.dim_conv3, :, :])
+        x = self.conv(x)
+        return x
+
+    def forward_split_cat(self, x):
+        # for training/inference
+        # 将 x 通道分为两部分，一部分为 in_channel//n_div, 另一部分为 in_channel - in_channel//n_div
+        x1, x2 = torch.split(x, [self.dim_conv3, self.dim_untouched], dim=1)
+        # 对 x1 部分卷积 --> in_channel = in_channel // n_div; output_channel = in_channel // n_div --> 保持通道数不变
+        x1 = self.partial_conv3(x1)
+        # 在通道上拼接 x1, x2
+        x = torch.cat((x1, x2), 1)
+        # 对 x 做一个卷积，改变通道数
+        x = self.conv(x)
+        return x
+
+
+class PWConv(nn.Module):
+    def __init__(self, c1, c2, k=1, s=1, g=1):
+        super(PWConv, self).__init__()
+        self.conv = nn.Conv2d(c1, c2, kernel_size=k,
+                              stride=s, groups=g, bias=False)
+
+    def forward(self, x):
+        return self.conv(x)
+
+
+class ShuffleAttentionV1(nn.Module):
+    def __init__(self, forward_state, channel=512, reduction=16, G=8, n_div=4):
+        super(ShuffleAttentionV1, self).__init__()
+        self.n_div = n_div
+        self.G = G
+        self.channel = channel
+        self.avg_pool = nn.AdaptiveAvgPool2d(1)
+        self.gn = nn.GroupNorm(channel // (2 * G), channel // (2 * G))
+        self.cweight = Parameter(torch.zeros(
+            1, channel // (2 * G), 1, 1), requires_grad=True)
+        self.cbias = Parameter(torch.ones(
+            1, channel // (2 * G), 1, 1), requires_grad=True)
+        self.sweight = Parameter(torch.zeros(
+            1, channel // (2 * G), 1, 1), requires_grad=True)
+        self.sbias = Parameter(torch.ones(
+            1, channel // (2 * G), 1, 1), requires_grad=True)
+        self.sigmoid = nn.Sigmoid()
+
+        if forward_state == 'forward_channel':
+            self.forward = self.forward_channel
+        elif forward_state == 'forward_spatial':
+            self.forward = self.forward_spatial
+        else:
+            raise NotImplementedError
+
+    def init_weights(self):
+        for m in self.modules():
+            if isinstance(m, nn.Conv2d):
+                init.kaiming_normal_(m.weight, mode='fan_out')
+                if m.bias is not None:
+                    init.constant_(m.bias, 0)
+            elif isinstance(m, nn.BatchNorm2d):
+                init.constant_(m.weight, 1)
+                init.constant_(m.bias, 0)
+            elif isinstance(m, nn.Linear):
+                init.normal_(m.weight, std=0.001)
+                if m.bias is not None:
+                    init.constant_(m.bias, 0)
+
+    @staticmethod
+    def channel_shuffle(x, groups):
+        b, c, h, w = x.shape
+        x = x.reshape(b, groups, -1, h, w)
+        x = x.permute(0, 2, 1, 3, 4)
+
+        # flatten
+        x = x.reshape(b, -1, h, w)
+        return x
+
+    def forward_channel(self, x):
+        b, c, h, w = x.size()
+        # group into subfeatures
+        x = x.view(b * self.G, -1, h, w)
+        x_0, _ = x.chunk(2, dim=1)
+
+        # channel attention
+        x_channel = self.avg_pool(x_0)
+        x_channel = self.cweight * x_channel + self.cbias
+        x_channel = x_0 * self.sigmoid(x_channel)
+        return x_channel
+
+    def forward_spatial(self, x):
+        b, c, h, w = x.size()
+        # group into subfeatures
+        x = x.view(b * self.G, -1, h, w)
+        _, x_1 = x.chunk(2, dim=1)
+
+        # spatial attention
+        x_spatial = self.gn(x_1)
+        x_spatial = self.sweight * x_spatial + self.sbias
+        x_spatial = x_1 * self.sigmoid(x_spatial)
+        return x_spatial
+
+
+class P2CF(nn.Module):
+    
+    # 标准瓶颈结构，残差结构
+    # c1为输入通道数，c2为输出通道数
+    def __init__(self, c1, c2, shortcut=True, g=1, k=(3, 3), e=0.5):
+        super().__init__()
+        c_ = int(c2 * e)  # hidden channels
+        self.channel_shuffle = ShuffleAttentionV1.channel_shuffle
+        self.pconv1 = PConv(c1, c_)
+        self.spatial_attention = ShuffleAttentionV1(channel=c_, forward_state='forward_spatial')
+        self.pwconv = PWConv(c1, c_, k=1, g=g)
+        self.channel_attention = ShuffleAttentionV1(channel=c_, forward_state='forward_channel')
+        self.bn = nn.BatchNorm2d(c_)
+        self.relu = nn.ReLU(inplace=True)
+        self.pconv2 = PConv(c_, c2)
+        self.add = shortcut and c1 == c2
+    
+    def forward(self, x):
+        b, c, h, w = x.size()
+        
+        x_spatial = self.spatial_attention(self.pconv1(x))
+        x_channel = self.channel_attention(self.pwconv(x))
+        # concatenate features
+        out = torch.cat([x_channel, x_spatial], dim=1)
+        out = out.contiguous().view(b, -1, h, w)
+        # channel shuffle
+        out = self.channel_shuffle(out, 2)
+        # BN + ReLU
+        out = self.relu(self.bn(out))
+        
+        if self.add:
+            out = x + self.pconv2(out)
+        else:
+            out = self.pconv2(out)
+        return out
+
+
+class C2f_A(nn.Module):
+    # CSPNet结构结构，大残差结构
+    # c1为输入通道数，c2为输出通道数
+    def __init__(self, c1, c2, n=1, shortcut=False, g=1, e=0.5):
+        super().__init__()
+        self.c = int(c2 * e)
+        self.cv1 = Conv(c1, 2 * self.c, 1, 1)
+        # self.cv1 = PWConv(c1, 2 * self.c, 1, 1)
+        self.cv2 = Conv((2 + n) * self.c, c2, 1)
+        # self.cv2 = PWConv((2 + n) * self.c, c2, 1)
+        # self.m      = nn.ModuleList(Bottleneck(self.c, self.c, shortcut, g, k=((3, 3), (3, 3)), e=1.0) for _ in range(n))
+        self.m = nn.ModuleList(Bottleneck(self.c, self.c, shortcut, g, k=((3, 3), (3, 3)), e=1.0) for _ in range(n))
+    
+    def forward(self, x):
+        """Forward pass through C2f layer."""
+        y = list(self.cv1(x).chunk(2, 1))
+        y.extend(m(y[-1]) for m in self.m)
+        return self.cv2(torch.cat(y, 1))
+
+    def forward_split(self, x):
+        """Forward pass using split() instead of chunk()."""
+        y = self.cv1(x).split((self.c, self.c), 1)
+        y = [y[0], y[1]]
+        y.extend(m(y[-1]) for m in self.m)
+        return self.cv2(torch.cat(y, 1))
+    
+
+class C3k_A(C3):
+    """C3k is a CSP bottleneck module with customizable kernel sizes for feature extraction in neural networks."""
+
+    def __init__(self, c1, c2, n=1, shortcut=True, g=1, e=0.5, k=3):
+        """
+        Initialize C3k module.
+
+        Args:
+            c1 (int): Input channels.
+            c2 (int): Output channels.
+            n (int): Number of Bottleneck blocks.
+            shortcut (bool): Whether to use shortcut connections.
+            g (int): Groups for convolutions.
+            e (float): Expansion ratio.
+            k (int): Kernel size.
+        """
+        super().__init__(c1, c2, n, shortcut, g, e)
+        c_ = int(c2 * e)  # hidden channels
+        # self.m = nn.Sequential(*(RepBottleneck(c_, c_, shortcut, g, k=(k, k), e=1.0) for _ in range(n)))
+        self.m = nn.Sequential(*(P2CF(c_, c_, shortcut, e=1.0) for _ in range(n)))
+
+
+class C3k2_A(C2f_A):
+    """Faster Implementation of CSP Bottleneck with 2 convolutions."""
+
+    def __init__(self, c1, c2, n=1, c3k=False, e=0.5, g=1, shortcut=True):
+        """
+        Initialize C3k2 module.
+
+        Args:
+            c1 (int): Input channels.
+            c2 (int): Output channels.
+            n (int): Number of blocks.
+            c3k (bool): Whether to use C3k blocks.
+            e (float): Expansion ratio.
+            g (int): Groups for convolutions.
+            shortcut (bool): Whether to use shortcut connections.
+        """
+        super().__init__(c1, c2, n, shortcut, g, e)
+        self.m = nn.ModuleList(
+            C3k_A(self.c, self.c, 2, shortcut, g) if c3k else P2CF(self.c, self.c, shortcut) for _ in range(n)
+        )
+
+
+class LSKblock(nn.Module):
+    def __init__(self, dim):
+        super().__init__()
+        self.conv0 = nn.Conv2d(dim, dim, 5, padding=2, groups=dim)
+        self.conv_spatial = nn.Conv2d(dim, dim, 7, stride=1, padding=9, groups=dim, dilation=3)
+        self.conv1 = nn.Conv2d(dim, dim//2, 1)
+        self.conv2 = nn.Conv2d(dim, dim//2, 1)
+        self.conv_squeeze = nn.Conv2d(2, 2, 7, padding=3)
+        self.conv = nn.Conv2d(dim//2, dim, 1)
+
+    def forward(self, x):   
+        attn1 = self.conv0(x)
+        attn2 = self.conv_spatial(attn1)
+
+        attn1 = self.conv1(attn1)
+        attn2 = self.conv2(attn2)
+        
+        attn = torch.cat([attn1, attn2], dim=1)
+        avg_attn = torch.mean(attn, dim=1, keepdim=True)
+        max_attn, _ = torch.max(attn, dim=1, keepdim=True)
+        agg = torch.cat([avg_attn, max_attn], dim=1)
+        sig = self.conv_squeeze(agg).sigmoid()
+        attn = attn1 * sig[:,0,:,:].unsqueeze(1) + attn2 * sig[:,1,:,:].unsqueeze(1)
+        attn = self.conv(attn)
+        return x * attn
+
+
+class C3k_B(C3):
+    """C3k is a CSP bottleneck module with customizable kernel sizes for feature extraction in neural networks."""
+
+    def __init__(self, c1, c2, n=1, shortcut=True, g=1, e=0.5, k=3):
+        """
+        Initialize C3k module.
+
+        Args:
+            c1 (int): Input channels.
+            c2 (int): Output channels.
+            n (int): Number of Bottleneck blocks.
+            shortcut (bool): Whether to use shortcut connections.
+            g (int): Groups for convolutions.
+            e (float): Expansion ratio.
+            k (int): Kernel size.
+        """
+        super().__init__(c1, c2, n, shortcut, g, e)
+        c_ = int(c2 * e)  # hidden channels
+        # self.m = nn.Sequential(*(RepBottleneck(c_, c_, shortcut, g, k=(k, k), e=1.0) for _ in range(n)))
+        self.m = nn.Sequential(*(LSKblock(c_) for _ in range(n)))
+
+
+class C3k2_B(C2f):
+    """Faster Implementation of CSP Bottleneck with 2 convolutions."""
+
+    def __init__(self, c1, c2, n=1, c3k=False, e=0.5, g=1, shortcut=True):
+        """
+        Initialize C3k2 module.
+
+        Args:
+            c1 (int): Input channels.
+            c2 (int): Output channels.
+            n (int): Number of blocks.
+            c3k (bool): Whether to use C3k blocks.
+            e (float): Expansion ratio.
+            g (int): Groups for convolutions.
+            shortcut (bool): Whether to use shortcut connections.
+        """
+        super().__init__(c1, c2, n, shortcut, g, e)
+        self.m = nn.ModuleList(
+            C3k2_A(self.c, self.c, 2, shortcut, g) if c3k else LSKblock(self.c) for _ in range(n)
+        )
+
+
+def init_rate_half(tensor):
+    if tensor is not None:
+        tensor.data.fill_(0.5)
+
+
+class ACmix(nn.Module):
+    def __init__(self, in_planes, out_planes, n=1, c3k=False, e=0.5):
+        super(ACmix, self).__init__()
+        self.in_planes = in_planes
+        self.out_planes = out_planes
+
+        self.local = C3k2(in_planes, out_planes, c3k, e)
+
+        self.rate1 = torch.nn.Parameter(torch.Tensor(1))
+        self.rate2 = torch.nn.Parameter(torch.Tensor(1))
+
+        self.conv = nn.Conv2d(self.in_planes, self.out_planes, 3, padding=1)
+        self.conv_key = PWConv(in_planes, 1)
+
+        self.softmax = torch.nn.Softmax(dim=1)
+
+        self.Conv_value = nn.Sequential(
+            PWConv(self.in_planes, self.out_planes, 1),
+            nn.LayerNorm([self.out_planes, 1, 1]),
+            nn.ReLU(),
+            PWConv(self.out_planes, self.in_planes, 1),
+        )
+        self.change_channels = PWConv(self.in_planes, self.out_planes, 1)
+
+        self.reset_parameters()
+
+    def reset_parameters(self):
+        init_rate_half(self.rate1)
+        init_rate_half(self.rate2)
+
+    def forward(self, x):
+        k_trans = self.conv_key(x)
+        b, c, h, w = x.shape
+
+        key = self.softmax(k_trans.view(
+            b, 1, -1).permute(0, 2, 1).contiguous())
+        query = x.view(b, -1, h * w)
+        # b, c, h*w matmul b, h*w, 1 --> b, c, 1
+        concate_QK = torch.matmul(query, key).view(b, c, 1, 1).contiguous()
+        out_att = self.change_channels(x + self.Conv_value(concate_QK))
+
+        # conv
+        out_conv = self.local(x)
+
+        return self.rate1 * out_att + self.rate2 * out_conv
+
